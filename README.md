@@ -17,7 +17,16 @@ And it is free and crossplatform!
 
 https://artnetaudioplayer.github.io/
 
+# Running
+1. Set up a python virtual environment with Python 3.9:  
+   `conda create -n anetplayer python==3.9`  
+   `conda activate anetplayer`
+2. Install the pip dependencies:  
+   `pip install -r .\requirements.txt`
+3. Run with python:  
+   `python main.py`
+
 # About
 Python v. 3.7
-Using pygame and tkinter module
+Using vlc and tkinter module
 Also works fine with Python 3.9

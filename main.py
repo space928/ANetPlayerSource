@@ -8,11 +8,9 @@ def ask_quit():
     if tkMessageBox.askokcancel("Quit", "Exit Art-Net Audio Player?"):
         try:
             app.stop()  # Stop playing track
-            app.player.quit()  # Quit pygame.mixer
             root.destroy()  # Destroy the Tk Window instance.
         except TypeError:
             print("TypeError")
-            app.player.quit()
             root.destroy()
 
 

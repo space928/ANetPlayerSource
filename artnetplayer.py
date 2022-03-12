@@ -1,15 +1,28 @@
 import json
 import os
 import socket
+import sys
+from timeit import default_timer as timer
 
 import tkinter as tk
 import tkinter.ttk as ttk
 import webbrowser
+from os.path import isfile
 from tkinter import *
 from tkinter import filedialog
 
+from pydub import AudioSegment
+
+from matplotlib.backends.backend_tkagg import (
+    FigureCanvasTkAgg, NavigationToolbar2Tk)
+# Implement the default Matplotlib key bindings.
+from matplotlib.backend_bases import key_press_handler
+from matplotlib.figure import Figure
+
+import numpy as np
+
 import psutil
-import pygame
+import vlc
 from tinytag import TinyTag
 
 import artnet_tc
@@ -17,28 +30,39 @@ import paths
 
 global framerate
 framerate = 30
+max_audio_preview_seconds = 1
+interpolate_time = False
+
+_isMacOS   = sys.platform.startswith('darwin')
+_isWindows = sys.platform.startswith('win')
+_isLinux   = sys.platform.startswith('linux')
+
 
 class ArtNetPlayer(tk.Frame):
     paused = False
     stopped = True
 
-    listofsongs = []
-    durationofsongs = []
-    songsartnet_time = []
+    song_list = []
+    song_durations = []
+    songs_artnet_time = []
+    song_waveforms = []
 
     # Vars for play_update
     fr_prev = 0
     ext_time = 0
     slider_moved = False
+    prev_vlc_time = 0
+    interpolated_time = 0
+    prev_update_time = 0
 
-
-    def __init__(self, master, sizex = 450, sizey = 470, *args, **kwargs):
+    def __init__(self, master, sizex=450, sizey=700, *args, **kwargs):
         # Init Pygame Mixer
         super().__init__(master, **kwargs)
-        player = pygame.mixer
-        player.init()
-        player.music.set_volume(1)
-        self.player = player
+        args = []
+        if _isLinux:
+            args.append('--no-xlib')
+        self.Instance = vlc.Instance(args)
+        self.player = self.Instance.media_player_new()
 
         self.master = master
         self.master.title('Art-Net Audio Player  v1.1.3')
@@ -54,7 +78,7 @@ class ArtNetPlayer(tk.Frame):
         img = tk.Image("photo", file=file_path)
         # root.tk.call('wm', 'iconphoto', root._w, img)
         self.master.iconphoto(True, img)
-        self.master.resizable(False, False)
+        self.master.resizable(True, True)
 
         global framerate
         # Read JSON config
@@ -105,20 +129,70 @@ class ArtNetPlayer(tk.Frame):
         # Create Playlist Box
         self.song_box = Listbox(self.master_frame, bg="black", fg="green", width=60, height=8, selectbackground="green",
                                 selectforeground="black", relief=FLAT, border=0)
+
+        # panel for the audio waveform
+        fig = Figure(figsize=(8, 3.3), dpi=50)
+        t = np.arange(0, 3, .01)
+        self.mpl_plot = fig.add_subplot(111)
+        fig.tight_layout()
+        self.mpl_plot.plot(t, 2 * np.sin(2 * np.pi * t))
+        overlay = self.mpl_plot.twiny()
+        overlay.axvline(x=0.5, c="black")
+        overlay.axis('off')
+        self.mpl_plot.set_zorder(0)
+        overlay.set_zorder(1)
+
+        self.mpl_canvas = FigureCanvasTkAgg(fig, master=self.master_frame)  # A tk.DrawingArea.
+        self.mpl_canvas.draw()
+
+        #self.mpl_toolbar = NavigationToolbar2Tk(self.mpl_canvas, self.master)
+        #self.mpl_toolbar.update()
+
         # Create Music Position Slider
         self.my_slider = ttk.Scale(self.master_frame, from_=0, to=100, orient=HORIZONTAL, value=0,
                                    command=self.slider_update, length=400)
+
+        self.vol_slider_frame = Frame(self.master_frame)
+        self.vol_slider = ttk.Scale(self.vol_slider_frame, from_=0, to=100, orient=HORIZONTAL, value=100,
+                                    command=self.vol_update, length=100)
+        self.vol_slider_label_text = StringVar()
+        self.vol_slider_label_text.set('Volume (100)')
+        self.vol_slider_label = Label(self.vol_slider_frame, textvariable=self.vol_slider_label_text)
+        self.master_frame.pack(pady=15, side=TOP, fill=BOTH)
+
         # Create config window
-        self.conf_wind = Toplevel(self.master_frame)    ###
-        self.conf_wind.destroy()                        ###
+        self.conf_wind = Toplevel(self.master_frame)  ###
+        self.conf_wind.destroy()  ###
+
+    def on_key_press(self, event):
+        print("you pressed {}".format(event.key))
+        #key_press_handler(event, self.mpl_canvas, self.mpl_toolbar)
+
+    def on_mouse_click(self, event):
+        x, y = self.mpl_plot.transData.inverted().transform((event.x, event.y))
+        self.my_slider.config(value=x)
+        self.slider_update(x)
+        self.update_waveform(x)
+
+    def update_waveform(self, time):
+        # Update audio plot
+        self.mpl_plot.set_xlim((
+            time - max_audio_preview_seconds,
+            time + max_audio_preview_seconds)
+        )
+        self.mpl_plot.figure.canvas.draw()
 
     def create_widgets(self):
         self.song_box.grid(row=0, column=0)
         self.song_box.bind("<<ListboxSelect>>", self.callback_listbox)
 
+        self.mpl_canvas.get_tk_widget().grid(row=3, column=0, pady=10)
+        self.mpl_canvas.mpl_connect("key_press_event", self.on_key_press)
+        self.mpl_canvas.callbacks.connect('button_press_event', self.on_mouse_click)
+
         # Create Player Control Frame
         controls_frame = Frame(self.master_frame)
-        controls_frame.grid(row=3, column=0, pady=10)
+        controls_frame.grid(row=4, column=0, pady=10)
 
         # Create Player Control Buttons
         play_button = Button(controls_frame, image=self.play_btn_img, borderwidth=0, command=self.play)
@@ -131,7 +205,10 @@ class ArtNetPlayer(tk.Frame):
         stop_button.grid(row=0, column=2, padx=10)
 
         # Create Music Position Slider
-        self.my_slider.grid(row=5, column=0, pady=5)
+        self.my_slider.grid(row=6, column=0, pady=5)
+        self.vol_slider_label.grid(row=0, column=0, pady=5)
+        self.vol_slider.grid(row=0, column=1, pady=5)
+        self.vol_slider_frame.grid(row=7, column=0, pady=5)
 
         # Create ArtNet Frame
         anet_frame = Frame(self.master_frame)
@@ -143,7 +220,8 @@ class ArtNetPlayer(tk.Frame):
 
         self.anetTextTC = StringVar()
         self.anetTextTC.set('00:00:00:00')
-        self.tc_entry = Entry(anet_frame, width=10, textvariable=self.anetTextTC, font=(None, 11), justify=CENTER, relief=FLAT)
+        self.tc_entry = Entry(anet_frame, width=10, textvariable=self.anetTextTC, font=(None, 11), justify=CENTER,
+                              relief=FLAT)
         self.tc_entry.grid(row=2, column=1, pady=10, padx=5)
 
         button = ttk.Button(anet_frame, text="Save", width=8, command=self.save_tc)
@@ -151,7 +229,7 @@ class ArtNetPlayer(tk.Frame):
 
         # Create Labels Frame
         labels_frame = Frame(self.master_frame)
-        labels_frame.grid(row=4, column=0, pady=10)
+        labels_frame.grid(row=5, column=0, pady=10)
 
         # Create info Label
         info_labelTC1 = Label(labels_frame, text='AUDIO TC', justify=CENTER)
@@ -165,7 +243,7 @@ class ArtNetPlayer(tk.Frame):
 
         global framerate
         self.labeltextfps = StringVar()
-        self.labeltextfps.set('ART-NET TC   '+str(framerate)+' FPS')
+        self.labeltextfps.set('ART-NET TC   ' + str(framerate) + ' FPS')
         info_labelTC2 = Label(labels_frame, textvariable=self.labeltextfps, justify=CENTER)
         info_labelTC2.grid(row=0, column=2, padx=20)
 
@@ -212,12 +290,13 @@ class ArtNetPlayer(tk.Frame):
         label_conf.grid(row=2, column=0, padx=10, pady=5)
         label_conf = tk.Label(about_wind, text='If you like program, please donate')
         label_conf.grid(row=3, column=0, padx=10, pady=5)
-        lbl = tk.Label(about_wind, text=r"https://artnetaudioplayer.github.io/", fg="blue", cursor="hand2", font=(None, 14))
+        lbl = tk.Label(about_wind, text=r"https://artnetaudioplayer.github.io/", fg="blue", cursor="hand2",
+                       font=(None, 14))
         lbl.grid(row=4, column=0, padx=10, pady=5)
         lbl.bind("<Button-1>", self.callback)
 
     def open_config_window(self, sizex=360, sizey=220, offsetx=452):
-        self.conf_wind = Toplevel(self.master_frame)      ###
+        self.conf_wind = Toplevel(self.master_frame)  ###
         self.conf_wind.title("Configure params")
         # sets the geometry of toplevel
         x = self.master.winfo_x()
@@ -298,7 +377,7 @@ class ArtNetPlayer(tk.Frame):
             tk.messagebox.showerror(title='Socket Error', message='Fail sending Art-Net packet to ' + anet_device)
 
     def save_config(self):
-        if not self.player.music.get_busy():
+        if not self.player.is_playing():
             eth_index = self.eth_combobox.current()
             # Check that selected device answers
             self.check_udp_send()
@@ -327,16 +406,18 @@ class ArtNetPlayer(tk.Frame):
         song_path = ""
         song_length = 0
         song_artnet_time = 0
-        song_extetion = ""
+        song_extension = ""
+        song_waveform = ()
         song_index = self.song_box.curselection()
         try:
             if song_index[0] >= 0:
                 song_index = int(song_index[0])
-                song_path = self.listofsongs[song_index]
-                song_length = self.durationofsongs[song_index]
-                song_artnet_time = self.songsartnet_time[song_index]
-                song_extetion = str(song_path[-3:])
-                song_extetion = song_extetion.upper()  # make extension uppercase
+                song_path = self.song_list[song_index]
+                song_length = self.song_durations[song_index]
+                song_artnet_time = self.songs_artnet_time[song_index]
+                song_extension = str(song_path[-3:])
+                song_extension = song_extension.upper()  # make extension uppercase
+                song_waveform = self.song_waveforms[song_index]
         except IndexError:
             print("IndexError")
             self.status_bar.config(text=f'NOTHING SELECTED!  ')
@@ -346,10 +427,10 @@ class ArtNetPlayer(tk.Frame):
             print("TypeError")
             self.status_bar.config(text=f'NOTHING SELECTED!  ')
             self.my_slider.config(value=0)
-        return [song_path, song_length, song_artnet_time, song_extetion]
+        return [song_path, song_length, song_artnet_time, song_extension, song_waveform]
 
     def callback_listbox(self, event):
-        #self.stop()
+        # self.stop()
         param_list = self.active_song_param()
         print(param_list)
 
@@ -361,34 +442,38 @@ class ArtNetPlayer(tk.Frame):
             song_ext = param_list[3]
             song_anet_time = param_list[2]
             song_duration = param_list[1]
+            song_path = param_list[0]
             self.labeltextATC.set(artnet_tc.millis_to_tc(song_anet_time, framerate))
             print(artnet_tc.millis_to_tc(song_anet_time, framerate))
-            audio_duration = artnet_tc.millis_to_tc(song_duration*1000, framerate)
+            audio_duration = artnet_tc.millis_to_tc(song_duration * 1000, framerate)
             self.status_bar.config(text=audio_duration + '  ')
 
-            if song_ext == "WAV":
-                self.my_slider.state(['disabled'])
-                self.paused = False
-            else:
-                self.my_slider.state(['!disabled'])
-                self.paused = False
+            # Plot the current song
+            self.mpl_plot.clear()
+            self.mpl_plot.plot(param_list[4][1], param_list[4][0], lw=0.4)
+            self.mpl_plot.set_yticks([])
+            #self.mpl_plot.set_xticks(np.arange(0, param_list[4][1][-1], 1), np.arange(0, param_list[4][1][-1], 1))
+            self.mpl_plot.set_ylim((np.min(param_list[4][0]), np.max(param_list[4][0])))
+            self.update_waveform(0)
+
+            self.paused = False
         except TypeError:
             print("TypeError callback_listbox")
-
 
     def play_update(self):
         global framerate
 
-        if not self.player.music.get_busy():
-            return
-        millis = int(self.player.music.get_pos())
+        #if not self.player.is_playing():
+        #    return
+        millis = int(self.player.get_time())
 
         if self.slider_moved:
             slider_pos = int(self.my_slider.get()) * 1000
-            self.ext_time = millis + slider_pos
+            # IDK, probs important but causes bugs, so not for now
+            self.ext_time = 0 #millis + slider_pos
             self.slider_moved = False
 
-        fr_cur = int((millis / 1000*framerate) % framerate)
+        fr_cur = int((millis / 1000 * framerate) % framerate)
         if fr_cur != self.fr_prev:
             param_list = self.active_song_param()
             song_anet_time = param_list[2]
@@ -404,34 +489,34 @@ class ArtNetPlayer(tk.Frame):
 
         self.my_slider.after(5, self.play_update)
 
-    def track_play(self):
+    def track_play(self, first_update=False):
         if self.stopped or self.paused:
             return
         # Get song length of the selected file
         param_list = self.active_song_param()
         song_length = param_list[1]
         # Grab Current Song Elapsed Time
-        current_time = pygame.mixer.music.get_pos() / 1000
+        current_time = self.player.get_time() / 1000
 
-        if int(self.my_slider.get()) == int(current_time):
-            # Update Slider To position
-            slider_position = int(song_length)
-            self.my_slider.config(to=slider_position, value=int(current_time))
+        ntime = timer()
+        if not first_update and interpolate_time and current_time == self.prev_vlc_time:
+            self.interpolated_time += ntime - self.prev_update_time
+            self.prev_update_time = ntime
+            current_time = self.interpolated_time
         else:
+            self.interpolated_time = current_time
+            self.prev_vlc_time = current_time
+
+        if self.player.is_playing():
+            # Look I know it seems weird to check this after having checked self.paused and self.stopped,
+            # but it's 6:00 AM and idk what else to try
+            self.update_waveform(current_time)
+
             # Update Slider To position
             slider_position = int(song_length)
-            self.my_slider.config(to=slider_position, value=int(self.my_slider.get()))
+            self.my_slider.config(to=slider_position, value=current_time)
 
-            # Move this thing along by one second
-            next_time = int(self.my_slider.get()) + 1
-            self.my_slider.config(value=next_time)
-        # update time
-        self.status_bar.after(1000, self.track_play)
-        # Increase current time by 1 second
-        current_time += 1
-        # Output message on the end of audio
-        if not self.player.music.get_busy():
-            self.stop()
+        self.status_bar.after(20, self.track_play)
 
     def play(self):
         try:
@@ -441,36 +526,27 @@ class ArtNetPlayer(tk.Frame):
             param_list = self.active_song_param()
             song_ext = param_list[3]
             song_path = param_list[0]
-            print(song_ext)
             # Check if play button already pressed
-            if self.player.music.get_busy():
+            if self.player.is_playing():
                 return
             # Pause method behavior due to file extension
             if self.paused:
                 # Unpause
-                if song_ext == "WAV":
-                    self.player.music.unpause()
-                    self.paused = False
-                    self.status_bar.config(text=f'PLAYING...  ')
-                elif song_ext == "MP3" or song_ext == "OGG":
-                    self.player.music.play(loops=0, start=int(self.my_slider.get()))
-                    self.slider_moved = True
-                    self.paused = False
-                    self.status_bar.config(text=f'PLAYING...  ')
-                else:
-                    self.status_bar.config(text=f'WRONG FILE EXTENSION!  ')
-                    return
+                self.player.pause()
+                self.player.set_time(int(self.my_slider.get() * 1000))
+                self.paused = False
+                self.status_bar.config(text=f'PLAYING...  ')
             else:
-                try:
-                    self.player.music.load(song_path)
-                except pygame.error:
-                    print("Socket error")
+                if isfile(song_path):  # Creation
+                    m = self.Instance.media_new(str(song_path))  # Path, unicode
+                    self.player.set_media(m)
+
+                if self.player.play():
                     self.status_bar.config(text=f'Unknown data format  ')
                     tk.messagebox.showerror(title='Format Error', message='Unknown data format')
                     self.stop()
                     return
-
-                self.player.music.play(loops=0, start=int(self.my_slider.get()))
+                self.player.set_time(int(self.my_slider.get() * 1000))
                 self.status_bar.config(text=f'PLAYING...  ')
 
                 self.tc_entry.config(state='disabled')
@@ -478,7 +554,7 @@ class ArtNetPlayer(tk.Frame):
                 # Close config window, if exists
                 self.conf_wind.destroy()
             # update every 1 sec
-            self.track_play()
+            self.track_play(True)
             # update every 5 ms
             self.play_update()
         except IndexError:
@@ -495,7 +571,7 @@ class ArtNetPlayer(tk.Frame):
         self.song_box.configure(state=NORMAL)
 
     def stop(self):
-        self.player.music.stop()
+        self.player.stop()
         self.enable_gui()
         # song_box.selection_clear(ACTIVE)
         self.stopped = True
@@ -507,6 +583,7 @@ class ArtNetPlayer(tk.Frame):
         slider_position = int(song_length)
         self.my_slider.config(to=slider_position, value=0)
         self.status_bar.config(text=f'STOPPED  ')
+        self.update_waveform(0)
 
         # update Audio TC and ArtNet TC label data
         tc_str = artnet_tc.millis_to_tc(int(self.my_slider.get() * 1000), framerate)
@@ -519,11 +596,15 @@ class ArtNetPlayer(tk.Frame):
         self.paused = is_paused
         if self.paused:
             # Already pressed
+            # Yeah but play anyway
+            self.play()
             return
         else:
             # Pause
-            self.player.music.pause()
+            if self.player.get_media():
+                self.player.pause()  # toggles
             self.paused = True
+            self.update_waveform(self.player.get_time()/1000)
             self.status_bar.config(text=f'PAUSED  ')
 
     def save_tc(self):
@@ -532,13 +613,13 @@ class ArtNetPlayer(tk.Frame):
             if song_index[0] >= 0:
                 song_index = int(song_index[0])
                 print(song_index)
-                print(self.listofsongs[song_index])
+                print(self.song_list[song_index])
                 tcstr_append = self.anetTextTC.get()
                 tclist = tcstr_append.split(':')
                 fr_ms = int(round(int(tclist[3]) * 1000 / framerate))
                 msecs = int(tclist[0]) * 60 * 60 * 1000 + int(tclist[1]) * 60 * 1000 + int(tclist[2]) * 1000 + fr_ms + 1
                 # Save ArtNet offset to list
-                self.songsartnet_time[song_index] = msecs
+                self.songs_artnet_time[song_index] = msecs
                 # Output ArtNet offset
                 self.labeltextATC.set(artnet_tc.millis_to_tc(msecs, framerate))
         except IndexError:
@@ -549,7 +630,7 @@ class ArtNetPlayer(tk.Frame):
 
     def add_songs(self):
         songs = filedialog.askopenfilenames(initialdir='audio/', title="Choose an Audio File",
-                                            filetypes=(("Audio Files", "*.mp3 *.ogg *.wav"),
+                                            filetypes=(("Audio Files", "*.mp3 *.ogg *.wav *.m4a"),
                                                        ("mp3, ogg Files", "*.mp3 *.ogg"),
                                                        ("wav Files", "*.wav"), ("All Files", "*.*"),))
         # Loop through song list and replace directory info
@@ -557,14 +638,21 @@ class ArtNetPlayer(tk.Frame):
             # Insert into playlist
             song_name = paths.path_leaf(song)
             self.song_box.insert(END, song_name)
-            self.listofsongs.append(song)
+            self.song_list.append(song)
             tag = TinyTag.get(song)
-            #song1 = pygame.mixer.Sound(song)
-            self.durationofsongs.append(tag.duration)
-            self.songsartnet_time.append(0)
+            # song1 = pygame.mixer.Sound(song)
+            self.song_durations.append(tag.duration) # TODO: replace with: self.player.get_length() * 1e-3
+            self.songs_artnet_time.append(0)
             print(tag.duration)
             song_length_str = song_name + ' LENGTH: ' + str(int(tag.duration)) + ' secs  '
             self.status_bar.config(text=song_length_str)
+
+            # Load song waveform
+            audio = AudioSegment.from_file(song)
+            data = np.array(audio.get_array_of_samples())[::audio.channels]
+            fs = audio.frame_rate
+            self.song_waveforms.append((data, np.arange(0, len(data)/fs, 1/fs), fs))
+
         # set slider to zero pos
         self.my_slider.config(value=0)
 
@@ -573,21 +661,20 @@ class ArtNetPlayer(tk.Frame):
         # Delete Currently Selected Song
         self.song_box.delete(ANCHOR)
         # Stop Music if it's playing
-        self.player.music.stop()
+        self.player.stop()
 
     def delete_all_songs(self):
         self.stop()
         # Delete All Songs
         self.song_box.delete(0, END)
         # Stop Music if it's playing
-        self.player.music.stop()
+        self.player.stop()
 
     def slider_update(self, value):
         param_list = self.active_song_param()
         song_path = param_list[0]
         song_length = param_list[1]
         song_anet_time = param_list[2]
-        self.player.music.load(song_path)
         slider_size = int(song_length)
         self.my_slider.config(to=slider_size, value=self.my_slider.get())
 
@@ -599,6 +686,18 @@ class ArtNetPlayer(tk.Frame):
         self.slider_moved = True
 
         if self.stopped or self.paused:
+            self.update_waveform(self.my_slider.get())
             return
         elif not self.stopped or not self.paused:
-            pygame.mixer.music.play(loops=0, start=int(self.my_slider.get()))
+            self.player.set_time(int(self.my_slider.get() * 1e3))
+
+    def vol_update(self, value):
+        """Volume slider changed, adjust the audio volume.
+        """
+        vol = min(self.vol_slider.get(), 100)
+        self.vol_slider_label_text.set(f"Volume ({int(vol):>3})")
+        if self.player and not self.stopped:
+            # .audio_set_volume returns 0 if success, -1 otherwise,
+            # e.g. if the player is stopped or doesn't have media
+            if self.player.audio_set_volume(int(vol)):  # and self.player.get_media():
+                self.status_bar.config(text=f"Failed to set the volume: {int(vol):>3}.")
